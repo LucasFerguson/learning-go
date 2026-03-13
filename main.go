@@ -52,17 +52,143 @@ type channelKey struct {
 	url  string
 }
 
+type MergedWatchEntry struct {
+	Header            string `json:"header"`
+	Title             string `json:"title"`
+	TitleURL          string `json:"titleUrl"`
+	Subtitles         []struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	} `json:"subtitles"`
+	Time              string `json:"time"`
+	Products          []string `json:"products"`
+	ActivityControls  []string `json:"activityControls"`
+	Account           string `json:"account"`
+	YearOfActivity    int `json:"year_of_activity"`
+}
+
+type MergedWatchHistoryMetadata struct {
+	OldestTimestamp   string `json:"oldest_timestamp"`
+	YoungestTimestamp string `json:"youngest_timestamp"`
+	OldestYear        int `json:"oldest_year"`
+	YoungestYear      int `json:"youngest_year"`
+	TotalEntries      int `json:"total_entries"`
+}
+
+func mergeWatchHistory(inDir string) error {
+	historyFiles, err := findHistoryFiles(inDir)
+	if err != nil {
+		return err
+	}
+
+	if len(historyFiles) == 0 {
+		return fmt.Errorf("no watch-history.json files found in %s", inDir)
+	}
+
+	fmt.Printf("Merging %d watch-history.json file(s)...\n", len(historyFiles))
+
+	var allEntries []MergedWatchEntry
+	var oldestTime, youngestTime time.Time
+	oldestTimeStr := ""
+	youngestTimeStr := ""
+
+	for _, historyFile := range historyFiles {
+		fmt.Printf("Processing: %s\n", historyFile)
+
+		// Extract account name from path (e.g., lucas.everything.gmail or lucas16.gmail)
+		accountName := filepath.Base(filepath.Dir(historyFile))
+
+		f, err := os.Open(historyFile)
+		if err != nil {
+			return fmt.Errorf("error opening file %s: %w", historyFile, err)
+		}
+
+		var entries []MergedWatchEntry
+		decoder := json.NewDecoder(f)
+		if err := decoder.Decode(&entries); err != nil {
+			f.Close()
+			return fmt.Errorf("error decoding JSON from %s: %w", historyFile, err)
+		}
+		f.Close()
+
+		for i := range entries {
+			entries[i].Account = accountName
+			
+			// Parse time and extract year
+			if entries[i].Time != "" {
+				if t, err := time.Parse(time.RFC3339Nano, entries[i].Time); err == nil {
+					entries[i].YearOfActivity = t.Year()
+					
+					// Track oldest and youngest timestamps
+					if oldestTime.IsZero() || t.Before(oldestTime) {
+						oldestTime = t
+						oldestTimeStr = entries[i].Time
+					}
+					if youngestTime.IsZero() || t.After(youngestTime) {
+						youngestTime = t
+						youngestTimeStr = entries[i].Time
+					}
+				}
+			}
+
+			allEntries = append(allEntries, entries[i])
+		}
+	}
+
+	// Create metadata object
+	metadata := MergedWatchHistoryMetadata{
+		OldestTimestamp:   oldestTimeStr,
+		YoungestTimestamp: youngestTimeStr,
+		OldestYear:        oldestTime.Year(),
+		YoungestYear:      youngestTime.Year(),
+		TotalEntries:      len(allEntries),
+	}
+
+	// Generate filename with year range
+	filename := fmt.Sprintf("watch-history-merged-%d-%d.json", metadata.OldestYear, metadata.YoungestYear)
+	outputPath := filepath.Join(inDir, filename)
+	
+	// Write clean entries to main file
+	if err := writeJSON(outputPath, allEntries); err != nil {
+		return fmt.Errorf("error writing merged file: %w", err)
+	}
+
+	// Write metadata to sidecar file
+	metadataPath := filepath.Join(inDir, filename[:len(filename)-5]+".metadata.json")
+	if err := writeJSON(metadataPath, metadata); err != nil {
+		return fmt.Errorf("error writing metadata file: %w", err)
+	}
+
+	fmt.Printf("✓ Merged %d entries\n", len(allEntries))
+	fmt.Printf("  File: %s\n", outputPath)
+	fmt.Printf("  Metadata: %s\n", metadataPath)
+	fmt.Printf("  Year range: %d - %d\n", metadata.OldestYear, metadata.YoungestYear)
+	fmt.Printf("  Oldest: %s\n", oldestTimeStr)
+	fmt.Printf("  Youngest: %s\n", youngestTimeStr)
+
+	return nil
+}
+
 func main() {
-	inPath := flag.String("in", "", "Path to watch-history.json (required)")
-	outDir := flag.String("outdir", "out", "Output directory to write JSON files into")
+	inDir := flag.String("in", "./imports", "Path to imports directory containing watch-history.json files")
+	outDir := flag.String("outdir", "exports", "Output directory to write JSON files into")
 	startYear := flag.Int("start", 2020, "Start year (inclusive)")
 	endYear := flag.Int("end", 2026, "End year (inclusive)")
 	topN := flag.Int("top", 6, "Top N channels per year")
 	fullLimit := flag.Int("full-limit", 0, "Limit for channels_full_<YEAR>.json (0 = all channels)")
 	allTimeTop := flag.Int("alltime-top", 100, "Top N channels for all-time output")
+	merge := flag.Bool("merge", false, "Merge watch history files from all accounts into a single file with year information")
 	flag.Parse()
 
-	if *inPath == "" {
+	if *merge {
+		if err := mergeWatchHistory(*inDir); err != nil {
+			fmt.Fprintln(os.Stderr, "error during merge:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *inDir == "" {
 		fmt.Fprintln(os.Stderr, "error: -in is required")
 		os.Exit(2)
 	}
@@ -76,12 +202,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	f, err := os.Open(*inPath)
+	// Find all watch-history.json files in the imports directory
+	historyFiles, err := findHistoryFiles(*inDir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error opening input:", err)
+		fmt.Fprintln(os.Stderr, "error finding history files:", err)
 		os.Exit(1)
 	}
-	defer f.Close()
+	if len(historyFiles) == 0 {
+		fmt.Fprintln(os.Stderr, "error: no watch-history.json files found in", *inDir)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Found %d watch-history.json file(s):\n", len(historyFiles))
+	for _, f := range historyFiles {
+		fmt.Printf("  - %s\n", f)
+	}
 
 	yearCounts := make(map[int]map[channelKey]int)
 	yearTotals := make(map[int]int)
@@ -96,9 +231,19 @@ func main() {
 		yearParseFails[y] = 0
 	}
 
-	if err := streamParseAndAggregate(f, *startYear, *endYear, yearCounts, yearTotals, yearParseFails, allTimeCounts, &totalAllYears); err != nil {
-		fmt.Fprintln(os.Stderr, "error parsing json:", err)
-		os.Exit(1)
+	// Process all history files
+	for _, historyFile := range historyFiles {
+		f, err := os.Open(historyFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error opening file:", historyFile, err)
+			os.Exit(1)
+		}
+		if err := streamParseAndAggregate(f, *startYear, *endYear, yearCounts, yearTotals, yearParseFails, allTimeCounts, &totalAllYears); err != nil {
+			_ = f.Close()
+			fmt.Fprintln(os.Stderr, "error parsing json from", historyFile, ":", err)
+			os.Exit(1)
+		}
+		_ = f.Close()
 	}
 
 	// Build per-year results
@@ -207,6 +352,20 @@ func main() {
 	}
 
 	fmt.Printf("Wrote JSON outputs to: %s\n", *outDir)
+}
+
+func findHistoryFiles(inDir string) ([]string, error) {
+	var files []string
+	err := filepath.Walk(inDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && info.Name() == "watch-history.json" {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
 }
 
 func streamParseAndAggregate(

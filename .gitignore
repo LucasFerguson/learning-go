@@ -1,2 +1,4 @@
 watch-history.json
 exports/youtube
+imports/*
+exports/*
